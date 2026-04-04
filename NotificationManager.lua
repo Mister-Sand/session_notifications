@@ -3,12 +3,100 @@ script_author('Sand')
 script_version('1.0')
 
 local imgui = require('mimgui')
-local json = require('dkjson')
+
+local function load_json_module()
+    local ok_dkjson, dkjson = pcall(require, 'dkjson')
+    if ok_dkjson and type(dkjson) == 'table' then
+        return {
+            decode = function(text)
+                local value = dkjson.decode(text)
+                return value
+            end,
+            encode = function(value, state)
+                return dkjson.encode(value, state)
+            end
+        }
+    end
+
+    local ok_cjson, cjson = pcall(require, 'cjson')
+    if ok_cjson and type(cjson) == 'table' then
+        return {
+            decode = function(text)
+                local ok, value = pcall(cjson.decode, text)
+                if ok then
+                    return value
+                end
+                return nil
+            end,
+            encode = function(value)
+                return cjson.encode(value)
+            end
+        }
+    end
+
+    error('failed to load JSON module: dkjson and cjson are unavailable')
+end
+
+local function require_notification_library()
+    local last_error = nil
+
+    for _, module_name in ipairs({ 'session_notifications', 'lib.session_notifications' }) do
+        local ok, loaded = pcall(require, module_name)
+        if ok then
+            return loaded
+        end
+        last_error = loaded
+    end
+
+    return nil, last_error
+end
+
+local function set_frame_flag(frame, key, value)
+    if frame == nil then
+        return
+    end
+
+    pcall(function()
+        frame[key] = value
+    end)
+end
+
+local json = load_json_module()
 local notify = nil
 
 local MANAGER_HOST_NAME = 'NotificationManager'
 local HEARTBEAT_INTERVAL = 2
-local LIBRARY_RAW_URL = 'https://raw.githubusercontent.com/Mister-Sand/session_notifications/main/lib/session_notifications.lua'
+local PROJECT_REPO_URL = 'https://github.com/Mister-Sand/session_notifications'
+local QUEUE_POLL_INTERVAL = 0.12
+local ACTIVE_UPDATE_INTERVAL = 0.05
+local IDLE_LOOP_WAIT_MS = 100
+local DPI_SCALE = tonumber(MONET_DPI_SCALE) or 1
+
+local function dpi(value)
+    value = tonumber(value) or 0
+    if value < 0 then
+        return value
+    end
+    return value * DPI_SCALE
+end
+
+local function dpi_vec2(x, y)
+    return imgui.ImVec2(dpi(x), dpi(y))
+end
+
+local function max_value(a, b)
+    if a >= b then
+        return a
+    end
+    return b
+end
+
+local function min_value(a, b)
+    if a <= b then
+        return a
+    end
+    return b
+end
 
 local function detect_separator()
     local cwd = tostring(getWorkingDirectory() or '')
@@ -91,6 +179,7 @@ local history = {}
 local texture_cache = {}
 local session = nil
 local queue_offset = 0
+local queue_file_path = nil
 local history_filter = 1
 
 local function ensure_parent_directory(path)
@@ -100,81 +189,27 @@ local function ensure_parent_directory(path)
     end
 end
 
-local function write_text_file(path, content)
-    path = normalize_path(path)
-    ensure_parent_directory(path)
-    local file = assert(io.open(path, 'w'))
-    file:write(content)
-    file:close()
-end
-
-local function is_library_url_configured()
-    return LIBRARY_RAW_URL ~= '' and not LIBRARY_RAW_URL:find('<', 1, true)
-end
-
-local function http_get_async(url, on_success, on_error)
-    lua_thread.create(function()
-        local ok, response = pcall(function()
-            local requests = require('requests')
-            return requests.get(url, {
-                headers = {
-                    ['Accept-Encoding'] = 'identity',
-                    ['Connection'] = 'close'
-                },
-                timeout = 15
-            })
-        end)
-
-        if ok and type(response) == 'table'
-            and tonumber(response.status_code)
-            and response.status_code >= 200
-            and response.status_code < 300 then
-            on_success(tostring(response.text or ''))
-            return
-        end
-
-        if ok and type(response) == 'table' then
-            on_error(string.format('HTTP %s for %s', tostring(response.status_code), url))
-            return
-        end
-
-        on_error(tostring(response))
-    end)
-end
-
 local function ensure_notification_library(on_done)
     if doesFileExist(LIBRARY_PATH) then
         on_done(true)
         return
     end
 
-    if not is_library_url_configured() then
-        on_done(false, 'configure LIBRARY_RAW_URL in NotificationManager.lua')
-        return
-    end
-
-    http_get_async(LIBRARY_RAW_URL, function(text)
-        local ok, err = pcall(write_text_file, LIBRARY_PATH, text)
-        if not ok then
-            on_done(false, 'failed to save library: ' .. tostring(err))
-            return
-        end
-
-        on_done(true)
-    end, function(err)
-        on_done(false, 'failed to download library: ' .. tostring(err))
-    end)
+    on_done(false, string.format(
+        'session_notifications.lua is missing. Install it manually from %s',
+        PROJECT_REPO_URL
+    ))
 end
 
 local MAX_ACTIVE = 6
 local MAX_HISTORY = 250
-local TOAST_WIDTH = 370
-local TOAST_IMAGE = 52
-local TOAST_MIN_HEIGHT = 108
-local TOAST_MAX_HEIGHT = 440
-local TOAST_HEIGHT_BUFFER = 18
-local TOAST_GAP = 14
-local TOAST_MARGIN = 18
+local TOAST_WIDTH = dpi(370)
+local TOAST_IMAGE = dpi(52)
+local TOAST_MIN_HEIGHT = dpi(108)
+local TOAST_MAX_HEIGHT = dpi(440)
+local TOAST_HEIGHT_BUFFER = dpi(18)
+local TOAST_GAP = dpi(14)
+local TOAST_MARGIN = dpi(18)
 local HISTORY_FILTERS = { 'All', 'Active', 'Expired', 'Dismissed', 'Overflow' }
 
 local overlay_frame = imgui.OnFrame(
@@ -185,7 +220,7 @@ local overlay_frame = imgui.OnFrame(
         render_toasts()
     end
 )
-overlay_frame.HideCursor = true
+set_frame_flag(overlay_frame, 'HideCursor', true)
 
 local history_frame = imgui.OnFrame(
     function()
@@ -195,7 +230,7 @@ local history_frame = imgui.OnFrame(
         render_history_window()
     end
 )
-history_frame.HideCursor = false
+set_frame_flag(history_frame, 'HideCursor', false)
 
 local function file_size(path)
     path = normalize_path(path)
@@ -240,7 +275,7 @@ local function calc_text_size_safe(text, wrap_width)
         return size
     end
 
-    return imgui.ImVec2(#text * 7, imgui.GetTextLineHeight())
+    return imgui.ImVec2(#text * dpi(7), imgui.GetTextLineHeight())
 end
 
 local function calc_wrapped_text_height(text, wrap_width)
@@ -282,7 +317,7 @@ local function calc_wrapped_text_height(text, wrap_width)
         end
     end
 
-    return (lines * line_height) + math.max(0, lines - 1) * spacing
+    return (lines * line_height) + max_value(0, lines - 1) * spacing
 end
 
 local function ensure_item_texture(item)
@@ -295,49 +330,48 @@ local function ensure_item_texture(item)
     return item.texture
 end
 
-local function get_toast_layout(item)
-    local has_badge = ensure_item_texture(item) ~= nil
-    local content_x = has_badge and 98 or 16
-    local top_y = 16
-    local title_y = 40
-    local right_pad = 16
-    local action_height = 26
+local function build_toast_layout(item, has_badge)
+    local content_x = has_badge and dpi(98) or dpi(16)
+    local top_y = dpi(16)
+    local title_y = dpi(40)
+    local right_pad = dpi(16)
+    local action_height = dpi(26)
     local content_width = TOAST_WIDTH - content_x - right_pad
-    local wrap_width = content_width - 12
+    local wrap_width = content_width - dpi(12)
 
     local title_text = item.title ~= '' and item.title or item.text
     local body_text = item.text ~= '' and item.text or '-'
 
-    local title_height = math.max(imgui.GetTextLineHeight(), calc_wrapped_text_height(title_text, wrap_width))
-    local text_height = math.max(imgui.GetTextLineHeight(), calc_wrapped_text_height(body_text, wrap_width))
+    local title_height = max_value(imgui.GetTextLineHeight(), calc_wrapped_text_height(title_text, wrap_width))
+    local text_height = max_value(imgui.GetTextLineHeight(), calc_wrapped_text_height(body_text, wrap_width))
     local description_height = 0
 
-    local cursor_y = title_y + title_height + 8
+    local cursor_y = title_y + title_height + dpi(8)
     local text_y = cursor_y
     cursor_y = cursor_y + text_height
 
     local description_y = 0
     if item.description ~= '' then
-        cursor_y = cursor_y + 6
+        cursor_y = cursor_y + dpi(6)
         description_y = cursor_y
-        description_height = math.max(imgui.GetTextLineHeight(), calc_wrapped_text_height(item.description, wrap_width))
+        description_height = max_value(imgui.GetTextLineHeight(), calc_wrapped_text_height(item.description, wrap_width))
         cursor_y = cursor_y + description_height
     end
 
     local action_y = 0
     if item.action_label ~= '' and item.action_id ~= '' then
-        cursor_y = cursor_y + 8
+        cursor_y = cursor_y + dpi(8)
         action_y = cursor_y
         cursor_y = cursor_y + action_height
     end
 
-    cursor_y = cursor_y + 8
+    cursor_y = cursor_y + dpi(8)
     local footer_y = cursor_y
     local footer_height = imgui.GetTextLineHeight()
 
     local badge_bottom = has_badge and (top_y + TOAST_IMAGE) or 0
-    local min_content_bottom = math.max(badge_bottom, footer_y + footer_height)
-    local height = math.max(TOAST_MIN_HEIGHT, min_content_bottom + 16)
+    local min_content_bottom = max_value(badge_bottom, footer_y + footer_height)
+    local height = max_value(TOAST_MIN_HEIGHT, min_content_bottom + dpi(16))
 
     return {
         has_badge = has_badge,
@@ -355,6 +389,19 @@ local function get_toast_layout(item)
         footer_y = footer_y,
         height = height,
     }
+end
+
+local function get_toast_layout(item)
+    local has_badge = ensure_item_texture(item) ~= nil
+    if item.layout and item.layout_badge_state == has_badge then
+        return item.layout
+    end
+
+    local layout = build_toast_layout(item, has_badge)
+    item.layout = layout
+    item.layout_badge_state = has_badge
+    item.toast_height = min_value(layout.height + TOAST_HEIGHT_BUFFER, TOAST_MAX_HEIGHT)
+    return layout
 end
 
 local function to_vec4(color)
@@ -418,8 +465,12 @@ local function add_history(entry)
 end
 
 local function toast_height(item)
-    local layout_height = get_toast_layout(item).height + TOAST_HEIGHT_BUFFER
-    return math.min(layout_height, TOAST_MAX_HEIGHT)
+    if item.toast_height then
+        return item.toast_height
+    end
+
+    get_toast_layout(item)
+    return item.toast_height or TOAST_MIN_HEIGHT
 end
 
 local function expire_item(item, reason)
@@ -452,7 +503,10 @@ local function activate_notification(payload)
         is_hovered = false,
         closed = false,
         closed_reason = nil,
-        theme = payload.theme or notify.presets[payload.theme_name] or notify.presets.ocean
+        theme = payload.theme or notify.presets[payload.theme_name] or notify.presets.ocean,
+        layout = nil,
+        layout_badge_state = nil,
+        toast_height = nil
     }
 
     item.texture = resolve_texture(item.image_path)
@@ -487,9 +541,14 @@ local function sync_history_status(item)
 end
 
 local function poll_queue()
-    local paths = notify.get_paths()
-    local file = io.open(paths.queue_file, 'r')
+    local file = io.open(queue_file_path, 'r')
     if not file then
+        return
+    end
+
+    local queue_size = file:seek('end') or queue_offset
+    if queue_size <= queue_offset then
+        file:close()
         return
     end
 
@@ -515,9 +574,7 @@ local function poll_queue()
     file:close()
 end
 
-local function update_active()
-    local now_clock = os.clock()
-
+local function update_active(now_clock)
     for index = #active, 1, -1 do
         local item = active[index]
         local delta = now_clock - (item.last_clock or now_clock)
@@ -555,7 +612,7 @@ local function draw_badge(draw_list, origin_x, origin_y, size, theme, item)
         imgui.ImVec2(origin_x, origin_y),
         imgui.ImVec2(origin_x + size, origin_y + size),
         imgui.GetColorU32Vec4(to_vec4(theme.badge)),
-        12
+        dpi(12)
     )
 
     imgui.SetCursorPos(imgui.ImVec2(origin_x - imgui.GetWindowPos().x, origin_y - imgui.GetWindowPos().y))
@@ -580,8 +637,8 @@ function render_toasts()
         imgui.SetNextWindowPos(position, imgui.Cond.Always)
         imgui.SetNextWindowSize(imgui.ImVec2(TOAST_WIDTH, height), imgui.Cond.Always)
 
-        imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 16)
-        imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(16, 16))
+        imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, dpi(16))
+        imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, dpi_vec2(16, 16))
         imgui.PushStyleColor(imgui.Col.WindowBg, to_vec4(theme.background))
         imgui.PushStyleColor(imgui.Col.Border, to_vec4(theme.border))
 
@@ -602,46 +659,46 @@ function render_toasts()
 
         draw_list:AddRectFilled(
             imgui.ImVec2(win_pos.x, win_pos.y),
-            imgui.ImVec2(win_pos.x + 4, win_pos.y + win_size.y),
+            imgui.ImVec2(win_pos.x + dpi(4), win_pos.y + win_size.y),
             imgui.GetColorU32Vec4(to_vec4(theme.accent)),
-            16,
+            dpi(16),
             imgui.DrawCornerFlags.TopLeft + imgui.DrawCornerFlags.BotLeft
         )
 
         draw_list:AddRectFilled(
-            imgui.ImVec2(win_pos.x + 1, win_pos.y + win_size.y - 4),
-            imgui.ImVec2(win_pos.x + win_size.x - 1, win_pos.y + win_size.y - 1),
+            imgui.ImVec2(win_pos.x + dpi(1), win_pos.y + win_size.y - dpi(4)),
+            imgui.ImVec2(win_pos.x + win_size.x - dpi(1), win_pos.y + win_size.y - dpi(1)),
             imgui.GetColorU32Vec4(to_vec4(theme.accent_soft)),
-            12
+            dpi(12)
         )
 
         if layout.has_badge then
-            draw_badge(draw_list, win_pos.x + 18, win_pos.y + 18, TOAST_IMAGE, theme, item)
+            draw_badge(draw_list, win_pos.x + dpi(18), win_pos.y + dpi(18), TOAST_IMAGE, theme, item)
         end
 
-        imgui.SetCursorPos(imgui.ImVec2(layout.content_x, 16))
+        imgui.SetCursorPos(imgui.ImVec2(layout.content_x, dpi(16)))
         imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.meta))
         imgui.Text(trim_text(item.script_id, 24) .. '  ' .. format_clock(item.created_at))
         imgui.PopStyleColor()
 
-        imgui.SetCursorPos(imgui.ImVec2(320, 14))
+        imgui.SetCursorPos(dpi_vec2(320, 14))
         imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0, 0, 0, 0))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, to_vec4(theme.accent_soft))
         imgui.PushStyleColor(imgui.Col.ButtonActive, to_vec4(theme.accent_soft))
-        if imgui.Button('x##close_' .. item.id, imgui.ImVec2(28, 22)) then
+        if imgui.Button('x##close_' .. item.id, dpi_vec2(28, 22)) then
             expire_item(item, 'dismissed')
         end
         imgui.PopStyleColor(3)
 
         local has_action = item.action_label ~= '' and item.action_id ~= ''
         local footer_height = imgui.GetTextLineHeight()
-        local progress_reserved = (not item.sticky and item.duration > 0) and 12 or 0
+        local progress_reserved = (not item.sticky and item.duration > 0) and dpi(12) or 0
         local content_top = layout.title_y
         local footer_y = content_top
 
         if needs_scroll then
-            local action_reserved = has_action and (layout.action_height + 10) or 0
-            local content_height = math.max(34, height - content_top - footer_height - progress_reserved - action_reserved - 24)
+            local action_reserved = has_action and (layout.action_height + dpi(10)) or 0
+            local content_height = max_value(dpi(34), height - content_top - footer_height - progress_reserved - action_reserved - dpi(24))
 
             imgui.SetCursorPos(imgui.ImVec2(layout.content_x, content_top))
             imgui.BeginChild('##notification_toast_content_' .. item.id, imgui.ImVec2(layout.content_width, content_height), false)
@@ -652,7 +709,7 @@ function render_toasts()
             imgui.PopTextWrapPos()
             imgui.PopStyleColor()
 
-            imgui.Dummy(imgui.ImVec2(0, 6))
+            imgui.Dummy(dpi_vec2(0, 6))
 
             imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.text))
             imgui.PushTextWrapPos(imgui.GetCursorPosX() + layout.wrap_width)
@@ -661,7 +718,7 @@ function render_toasts()
             imgui.PopStyleColor()
 
             if item.description ~= '' then
-                imgui.Dummy(imgui.ImVec2(0, 6))
+                imgui.Dummy(dpi_vec2(0, 6))
                 imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.meta))
                 imgui.PushTextWrapPos(imgui.GetCursorPosX() + layout.wrap_width)
                 imgui.TextWrapped(item.description)
@@ -671,7 +728,7 @@ function render_toasts()
 
             item.is_hovered = item.is_hovered or imgui.IsWindowHovered()
             imgui.EndChild()
-            footer_y = content_top + content_height + 6
+            footer_y = content_top + content_height + dpi(6)
         else
             imgui.SetCursorPos(imgui.ImVec2(layout.content_x, content_top))
 
@@ -681,7 +738,7 @@ function render_toasts()
             imgui.PopTextWrapPos()
             imgui.PopStyleColor()
 
-            imgui.Dummy(imgui.ImVec2(0, 6))
+            imgui.Dummy(dpi_vec2(0, 6))
 
             imgui.SetCursorPosX(layout.content_x)
             imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.text))
@@ -691,7 +748,7 @@ function render_toasts()
             imgui.PopStyleColor()
 
             if item.description ~= '' then
-                imgui.Dummy(imgui.ImVec2(0, 6))
+                imgui.Dummy(dpi_vec2(0, 6))
                 imgui.SetCursorPosX(layout.content_x)
                 imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.meta))
                 imgui.PushTextWrapPos(imgui.GetCursorPosX() + layout.wrap_width)
@@ -700,7 +757,7 @@ function render_toasts()
                 imgui.PopStyleColor()
             end
 
-            footer_y = imgui.GetCursorPosY() + 6
+            footer_y = imgui.GetCursorPosY() + dpi(6)
         end
 
         if has_action then
@@ -719,7 +776,7 @@ function render_toasts()
                 expire_item(item, 'dismissed')
             end
             imgui.PopStyleColor(3)
-            footer_y = footer_y + layout.action_height + 8
+            footer_y = footer_y + layout.action_height + dpi(8)
         end
 
         imgui.SetCursorPos(imgui.ImVec2(layout.content_x, footer_y))
@@ -727,18 +784,18 @@ function render_toasts()
         if item.sticky then
             imgui.Text('Pinned notification')
         else
-            local left = math.max(0, item.expires_clock - now_clock)
+            local left = max_value(0, item.expires_clock - now_clock)
             imgui.Text(string.format('Closes in %.1fs', left))
         end
         imgui.PopStyleColor()
 
         if not item.sticky and item.duration > 0 then
-            local progress = math.max(0, math.min(1, (item.expires_clock - now_clock) / item.duration))
+            local progress = max_value(0, min_value(1, (item.expires_clock - now_clock) / item.duration))
             draw_list:AddRectFilled(
-                imgui.ImVec2(win_pos.x + 88, win_pos.y + win_size.y - 10),
-                imgui.ImVec2(win_pos.x + 88 + (win_size.x - 112) * progress, win_pos.y + win_size.y - 6),
+                imgui.ImVec2(win_pos.x + dpi(88), win_pos.y + win_size.y - dpi(10)),
+                imgui.ImVec2(win_pos.x + dpi(88) + (win_size.x - dpi(112)) * progress, win_pos.y + win_size.y - dpi(6)),
                 imgui.GetColorU32Vec4(to_vec4(theme.accent)),
-                3
+                dpi(3)
             )
         end
 
@@ -752,18 +809,18 @@ end
 
 local function history_card(entry, index)
     local theme = entry.theme or notify.presets.ocean
-    local height = 128
+    local height = dpi(128)
     if entry.description and entry.description ~= '' then
-        height = height + 26
+        height = height + dpi(26)
     end
     if entry.image_path and entry.image_path ~= '' then
-        height = height + 22
+        height = height + dpi(22)
     end
     if entry.action_label and entry.action_label ~= '' then
-        height = height + 22
+        height = height + dpi(22)
     end
 
-    imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 12)
+    imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, dpi(12))
     imgui.PushStyleColor(imgui.Col.ChildBg, to_vec4(theme.background))
     imgui.PushStyleColor(imgui.Col.Border, to_vec4(theme.border))
 
@@ -774,40 +831,40 @@ local function history_card(entry, index)
     local win_size = imgui.GetWindowSize()
     draw_list:AddRectFilled(
         imgui.ImVec2(win_pos.x, win_pos.y),
-        imgui.ImVec2(win_pos.x + 4, win_pos.y + win_size.y),
+        imgui.ImVec2(win_pos.x + dpi(4), win_pos.y + win_size.y),
         imgui.GetColorU32Vec4(to_vec4(theme.accent)),
-        12,
+        dpi(12),
         imgui.DrawCornerFlags.TopLeft + imgui.DrawCornerFlags.BotLeft
     )
     draw_list:AddRectFilled(
-        imgui.ImVec2(win_pos.x + 14, win_pos.y + 14),
-        imgui.ImVec2(win_pos.x + 84, win_pos.y + 40),
+        imgui.ImVec2(win_pos.x + dpi(14), win_pos.y + dpi(14)),
+        imgui.ImVec2(win_pos.x + dpi(84), win_pos.y + dpi(40)),
         imgui.GetColorU32Vec4(to_vec4(theme.badge)),
-        10
+        dpi(10)
     )
 
-    imgui.SetCursorPos(imgui.ImVec2(22, 18))
+    imgui.SetCursorPos(dpi_vec2(22, 18))
     imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.title))
     imgui.Text(status_label(entry.status))
     imgui.PopStyleColor()
 
-    imgui.SetCursorPos(imgui.ImVec2(98, 18))
+    imgui.SetCursorPos(dpi_vec2(98, 18))
     imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.meta))
     imgui.Text(string.format('%s  %s', trim_text(entry.script_id, 24), format_clock(entry.created_at)))
     imgui.PopStyleColor()
 
-    imgui.SetCursorPos(imgui.ImVec2(22, 52))
+    imgui.SetCursorPos(dpi_vec2(22, 52))
     imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.title))
     imgui.Text(trim_text(entry.title ~= '' and entry.title or entry.text, 60))
     imgui.PopStyleColor()
 
-    imgui.SetCursorPos(imgui.ImVec2(22, 76))
+    imgui.SetCursorPos(dpi_vec2(22, 76))
     imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.text))
     imgui.TextWrapped(entry.text ~= '' and entry.text or '-')
     imgui.PopStyleColor()
 
     if entry.description and entry.description ~= '' then
-        imgui.SetCursorPosY(imgui.GetCursorPosY() + 4)
+        imgui.SetCursorPosY(imgui.GetCursorPosY() + dpi(4))
         imgui.PushStyleColor(imgui.Col.Text, to_vec4(theme.meta))
         imgui.TextWrapped(entry.description)
         imgui.PopStyleColor()
@@ -831,11 +888,11 @@ local function history_card(entry, index)
 end
 
 function render_history_window()
-    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, 18)
-    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, imgui.ImVec2(18, 18))
+    imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, dpi(18))
+    imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, dpi_vec2(18, 18))
     imgui.PushStyleColor(imgui.Col.WindowBg, imgui.ImVec4(0.06, 0.07, 0.09, 0.98))
     imgui.PushStyleColor(imgui.Col.Border, imgui.ImVec4(0.16, 0.18, 0.22, 1.0))
-    imgui.SetNextWindowSize(imgui.ImVec2(760, 520), imgui.Cond.FirstUseEver)
+    imgui.SetNextWindowSize(dpi_vec2(760, 520), imgui.Cond.FirstUseEver)
     imgui.Begin('Notification History', history_open,
         imgui.WindowFlags.NoCollapse
     )
@@ -843,9 +900,9 @@ function render_history_window()
     local active_count = #active
     local total_count = #history
 
-    imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, 16)
+    imgui.PushStyleVarFloat(imgui.StyleVar.ChildRounding, dpi(16))
     imgui.PushStyleColor(imgui.Col.ChildBg, imgui.ImVec4(0.09, 0.11, 0.14, 1.0))
-    imgui.BeginChild('##history_header', imgui.ImVec2(0, 92), true)
+    imgui.BeginChild('##history_header', dpi_vec2(0, 92), true)
     imgui.PushStyleColor(imgui.Col.Text, imgui.ImVec4(0.95, 0.97, 1.0, 1.0))
     imgui.Text('Session History')
     imgui.PopStyleColor()
@@ -857,19 +914,19 @@ function render_history_window()
     imgui.PopStyleColor()
     imgui.PopStyleVar()
 
-    if imgui.Button('Spawn demo pack', imgui.ImVec2(130, 28)) then
+    if imgui.Button('Spawn demo pack', dpi_vec2(130, 28)) then
         push_demo_pack()
     end
     imgui.SameLine()
-    if imgui.Button('Clear history', imgui.ImVec2(110, 28)) then
+    if imgui.Button('Clear history', dpi_vec2(110, 28)) then
         history = {}
     end
     imgui.SameLine()
-    if imgui.Button('Close window', imgui.ImVec2(110, 28)) then
+    if imgui.Button('Close window', dpi_vec2(110, 28)) then
         history_open[0] = false
     end
     imgui.SameLine()
-    imgui.SetNextItemWidth(140)
+    imgui.SetNextItemWidth(dpi(140))
     if imgui.BeginCombo('##history_filter', HISTORY_FILTERS[history_filter]) then
         for index, label in ipairs(HISTORY_FILTERS) do
             local selected = history_filter == index
@@ -885,7 +942,7 @@ function render_history_window()
 
     imgui.Separator()
 
-    imgui.BeginChild('##history_scroll', imgui.ImVec2(0, 0), false)
+    imgui.BeginChild('##history_scroll', dpi_vec2(0, 0), false)
     local shown = 0
     if #history == 0 then
         imgui.Text('No notifications yet.')
@@ -972,9 +1029,9 @@ function main()
             return
         end
 
-        local ok_require, loaded_notify = pcall(require, 'session_notifications')
-        if not ok_require then
-            bootstrap_error = 'failed to load session_notifications.lua: ' .. tostring(loaded_notify)
+        local loaded_notify, load_err = require_notification_library()
+        if not loaded_notify then
+            bootstrap_error = 'failed to load session_notifications.lua: ' .. tostring(load_err)
             bootstrap_done = true
             return
         end
@@ -992,7 +1049,8 @@ function main()
     end
 
     session = notify.start_session(MANAGER_HOST_NAME)
-    queue_offset = file_size(notify.get_paths().queue_file)
+    queue_file_path = notify.get_paths().queue_file
+    queue_offset = file_size(queue_file_path)
     notify.set_runtime({
         host_name = MANAGER_HOST_NAME,
         session_id = session.session_id,
@@ -1006,13 +1064,25 @@ function main()
 
     register_commands()
     local last_heartbeat = os.clock()
+    local last_queue_poll_clock = 0
+    local last_active_update_clock = 0
 
     while true do
-        wait(0)
-        poll_queue()
-        update_active()
-
         local now_clock = os.clock()
+        local is_busy = #active > 0 or history_open[0]
+        wait(is_busy and 0 or IDLE_LOOP_WAIT_MS)
+
+        now_clock = os.clock()
+        if now_clock - last_queue_poll_clock >= QUEUE_POLL_INTERVAL then
+            poll_queue()
+            last_queue_poll_clock = now_clock
+        end
+
+        if #active > 0 and (now_clock - last_active_update_clock >= ACTIVE_UPDATE_INTERVAL) then
+            update_active(now_clock)
+            last_active_update_clock = now_clock
+        end
+
         if now_clock - last_heartbeat >= HEARTBEAT_INTERVAL then
             notify.touch_runtime({
                 host_name = MANAGER_HOST_NAME,

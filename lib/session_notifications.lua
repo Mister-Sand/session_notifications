@@ -1,4 +1,37 @@
-local json = require('dkjson')
+local function load_json_module()
+    local ok_dkjson, dkjson = pcall(require, 'dkjson')
+    if ok_dkjson and type(dkjson) == 'table' then
+        return {
+            decode = function(text)
+                local value = dkjson.decode(text)
+                return value
+            end,
+            encode = function(value, state)
+                return dkjson.encode(value, state)
+            end
+        }
+    end
+
+    local ok_cjson, cjson = pcall(require, 'cjson')
+    if ok_cjson and type(cjson) == 'table' then
+        return {
+            decode = function(text)
+                local ok, value = pcall(cjson.decode, text)
+                if ok then
+                    return value
+                end
+                return nil
+            end,
+            encode = function(value)
+                return cjson.encode(value)
+            end
+        }
+    end
+
+    error('failed to load JSON module: dkjson and cjson are unavailable')
+end
+
+local json = load_json_module()
 
 local M = {
     VERSION = '1.0'
@@ -55,6 +88,8 @@ local ACTION_QUEUE_FILE = join_path(BASE_DIR, 'actions.jsonl')
 local CURSOR_DIR = join_path(BASE_DIR, 'cursors')
 
 local callbacks = {}
+local action_poll_state = {}
+local ACTION_POLL_INTERVAL = 0.10
 
 local PRESETS = {
     ocean = {
@@ -98,6 +133,13 @@ local PRESETS = {
         badge = { 0.16, 0.17, 0.20, 1.0 }
     }
 }
+
+local function max_value(a, b)
+    if a >= b then
+        return a
+    end
+    return b
+end
 
 local function ensure_dir(path)
     path = normalize_path(path)
@@ -367,7 +409,7 @@ end
 local function compare_versions(left, right)
     local a = split_version(left)
     local b = split_version(right)
-    local count = math.max(#a, #b)
+    local count = max_value(#a, #b)
 
     for index = 1, count do
         local av = a[index] or 0
@@ -1100,9 +1142,35 @@ function M.process_actions()
 
     local script_id = get_script_id()
     local cursor_path = get_cursor_path(script_id)
-    local offset = read_number_file(cursor_path)
+    local poll_state = action_poll_state[script_id]
+    if not poll_state then
+        poll_state = {
+            offset = nil,
+            last_poll_clock = 0
+        }
+        action_poll_state[script_id] = poll_state
+    end
+
+    local now_clock = os.clock()
+    if (now_clock - poll_state.last_poll_clock) < ACTION_POLL_INTERVAL then
+        return 0
+    end
+    poll_state.last_poll_clock = now_clock
+
+    local offset = poll_state.offset
+    if offset == nil then
+        offset = read_number_file(cursor_path)
+        poll_state.offset = offset
+    end
+
     local file = io.open(ACTION_QUEUE_FILE, 'r')
     if not file then
+        return 0
+    end
+
+    local queue_size = file:seek('end') or offset
+    if queue_size <= offset then
+        file:close()
         return 0
     end
 
@@ -1132,7 +1200,12 @@ function M.process_actions()
 
     offset = file:seek() or offset
     file:close()
-    write_file(cursor_path, tostring(offset))
+
+    if offset ~= poll_state.offset then
+        poll_state.offset = offset
+        write_file(cursor_path, tostring(offset))
+    end
+
     return processed
 end
 
