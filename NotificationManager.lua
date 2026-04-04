@@ -70,6 +70,8 @@ local PROJECT_REPO_URL = 'https://github.com/Mister-Sand/session_notifications'
 local QUEUE_POLL_INTERVAL = 0.12
 local ACTIVE_UPDATE_INTERVAL = 0.05
 local IDLE_LOOP_WAIT_MS = 100
+local MOBILE_TOAST_MAX_SCREEN_RATIO = 0.38
+local MOBILE_TOAST_WIDTH_SCREEN_RATIO = 0.34
 local DPI_SCALE = tonumber(MONET_DPI_SCALE) or 1
 
 local function dpi(value)
@@ -244,6 +246,15 @@ local function file_size(path)
     return size
 end
 
+local function get_toast_width(screen_width)
+    local toast_width = TOAST_WIDTH
+    if MONET_DPI_SCALE ~= nil then
+        toast_width = max_value(TOAST_WIDTH, screen_width * MOBILE_TOAST_WIDTH_SCREEN_RATIO)
+        toast_width = min_value(toast_width, screen_width - dpi(24))
+    end
+    return toast_width
+end
+
 local function trim_text(text, limit)
     text = tostring(text or '')
     if #text <= limit then
@@ -255,13 +266,10 @@ local function trim_text(text, limit)
     return text:sub(1, limit - 3) .. '...'
 end
 
-local function calc_text_size_safe(text, wrap_width)
+local function calc_text_size_safe(text)
     text = tostring(text or '')
 
     local ok, size = pcall(function()
-        if wrap_width and wrap_width > 0 then
-            return imgui.CalcTextSize(text, false, wrap_width)
-        end
         return imgui.CalcTextSize(text)
     end)
     if ok and size then
@@ -269,7 +277,7 @@ local function calc_text_size_safe(text, wrap_width)
     end
 
     ok, size = pcall(function()
-        return imgui.CalcTextSize(text, nil, false, wrap_width or -1)
+        return imgui.CalcTextSize(text, nil, false, -1)
     end)
     if ok and size then
         return size
@@ -278,22 +286,44 @@ local function calc_text_size_safe(text, wrap_width)
     return imgui.ImVec2(#text * dpi(7), imgui.GetTextLineHeight())
 end
 
+local function split_long_token(token, wrap_width)
+    local parts = {}
+    local current = ''
+
+    for index = 1, #token do
+        local char = token:sub(index, index)
+        local candidate = current .. char
+
+        if current ~= '' and calc_text_size_safe(candidate).x > wrap_width then
+            table.insert(parts, current)
+            current = char
+        else
+            current = candidate
+        end
+    end
+
+    if current ~= '' then
+        table.insert(parts, current)
+    end
+
+    return parts
+end
+
 local function calc_wrapped_text_height(text, wrap_width)
     text = tostring(text or '')
     if text == '' then
         return 0
     end
 
-    local ok, size = pcall(function()
-        return calc_text_size_safe(text, wrap_width)
-    end)
-    if ok and size and size.y and size.y > 0 then
-        return size.y
-    end
-
     local line_height = imgui.GetTextLineHeight()
-    local spacing = imgui.GetStyle().ItemSpacing.y
     local lines = 0
+
+    if not wrap_width or wrap_width <= 0 then
+        for _ in (text .. '\n'):gmatch('(.-)\n') do
+            lines = lines + 1
+        end
+        return lines * line_height
+    end
 
     for raw_line in (text .. '\n'):gmatch('(.-)\n') do
         if raw_line == '' then
@@ -301,23 +331,42 @@ local function calc_wrapped_text_height(text, wrap_width)
         else
             local current = ''
             for word in raw_line:gmatch('%S+') do
-                local candidate = current == '' and word or (current .. ' ' .. word)
-                local width = calc_text_size_safe(candidate).x
-                if current ~= '' and wrap_width > 0 and width > wrap_width then
-                    lines = lines + 1
-                    current = word
-                else
-                    current = candidate
+                local parts = { word }
+                if calc_text_size_safe(word).x > wrap_width then
+                    parts = split_long_token(word, wrap_width)
+                end
+
+                for _, part in ipairs(parts) do
+                    local candidate = current == '' and part or (current .. ' ' .. part)
+                    local width = calc_text_size_safe(candidate).x
+
+                    if current ~= '' and width > wrap_width then
+                        lines = lines + 1
+                        current = part
+                    else
+                        current = candidate
+                    end
                 end
             end
 
-            if current ~= '' then
+            if current == '' then
                 lines = lines + 1
+            else
+                if calc_text_size_safe(current).x > wrap_width then
+                    local parts = split_long_token(current, wrap_width)
+                    for _, part in ipairs(parts) do
+                        if part ~= '' then
+                            lines = lines + 1
+                        end
+                    end
+                else
+                    lines = lines + 1
+                end
             end
         end
     end
 
-    return (lines * line_height) + max_value(0, lines - 1) * spacing
+    return lines * line_height
 end
 
 local function ensure_item_texture(item)
@@ -330,48 +379,13 @@ local function ensure_item_texture(item)
     return item.texture
 end
 
-local function build_toast_layout(item, has_badge)
+local function build_toast_layout(item, has_badge, toast_width)
     local content_x = has_badge and dpi(98) or dpi(16)
-    local top_y = dpi(16)
     local title_y = dpi(40)
     local right_pad = dpi(16)
     local action_height = dpi(26)
-    local content_width = TOAST_WIDTH - content_x - right_pad
+    local content_width = toast_width - content_x - right_pad
     local wrap_width = content_width - dpi(12)
-
-    local title_text = item.title ~= '' and item.title or item.text
-    local body_text = item.text ~= '' and item.text or '-'
-
-    local title_height = max_value(imgui.GetTextLineHeight(), calc_wrapped_text_height(title_text, wrap_width))
-    local text_height = max_value(imgui.GetTextLineHeight(), calc_wrapped_text_height(body_text, wrap_width))
-    local description_height = 0
-
-    local cursor_y = title_y + title_height + dpi(8)
-    local text_y = cursor_y
-    cursor_y = cursor_y + text_height
-
-    local description_y = 0
-    if item.description ~= '' then
-        cursor_y = cursor_y + dpi(6)
-        description_y = cursor_y
-        description_height = max_value(imgui.GetTextLineHeight(), calc_wrapped_text_height(item.description, wrap_width))
-        cursor_y = cursor_y + description_height
-    end
-
-    local action_y = 0
-    if item.action_label ~= '' and item.action_id ~= '' then
-        cursor_y = cursor_y + dpi(8)
-        action_y = cursor_y
-        cursor_y = cursor_y + action_height
-    end
-
-    cursor_y = cursor_y + dpi(8)
-    local footer_y = cursor_y
-    local footer_height = imgui.GetTextLineHeight()
-
-    local badge_bottom = has_badge and (top_y + TOAST_IMAGE) or 0
-    local min_content_bottom = max_value(badge_bottom, footer_y + footer_height)
-    local height = max_value(TOAST_MIN_HEIGHT, min_content_bottom + dpi(16))
 
     return {
         has_badge = has_badge,
@@ -379,28 +393,22 @@ local function build_toast_layout(item, has_badge)
         content_width = content_width,
         wrap_width = wrap_width,
         title_y = title_y,
-        title_text = title_text,
-        text_y = text_y,
-        body_text = body_text,
-        description_y = description_y,
-        description_height = description_height,
-        action_y = action_y,
         action_height = action_height,
-        footer_y = footer_y,
-        height = height,
+        title_text = item.title ~= '' and item.title or item.text,
+        body_text = item.text ~= '' and item.text or '-',
     }
 end
 
-local function get_toast_layout(item)
+local function get_toast_layout(item, toast_width)
     local has_badge = ensure_item_texture(item) ~= nil
-    if item.layout and item.layout_badge_state == has_badge then
+    if item.layout and item.layout_badge_state == has_badge and item.layout_width == toast_width then
         return item.layout
     end
 
-    local layout = build_toast_layout(item, has_badge)
+    local layout = build_toast_layout(item, has_badge, toast_width)
     item.layout = layout
     item.layout_badge_state = has_badge
-    item.toast_height = min_value(layout.height + TOAST_HEIGHT_BUFFER, TOAST_MAX_HEIGHT)
+    item.layout_width = toast_width
     return layout
 end
 
@@ -465,12 +473,11 @@ local function add_history(entry)
 end
 
 local function toast_height(item)
-    if item.toast_height then
-        return item.toast_height
+    if item.measured_height then
+        return item.measured_height
     end
 
-    get_toast_layout(item)
-    return item.toast_height or TOAST_MIN_HEIGHT
+    return TOAST_MIN_HEIGHT
 end
 
 local function expire_item(item, reason)
@@ -506,7 +513,10 @@ local function activate_notification(payload)
         theme = payload.theme or notify.presets[payload.theme_name] or notify.presets.ocean,
         layout = nil,
         layout_badge_state = nil,
-        toast_height = nil
+        layout_width = nil,
+        measured_height = nil,
+        full_height = nil,
+        needs_scroll = false
     }
 
     item.texture = resolve_texture(item.image_path)
@@ -621,21 +631,26 @@ end
 
 function render_toasts()
     local sw, sh = getScreenResolution()
+    local toast_width = get_toast_width(sw)
+    local toast_max_height = TOAST_MAX_HEIGHT
+    if MONET_DPI_SCALE ~= nil then
+        toast_max_height = min_value(TOAST_MAX_HEIGHT, sh * MOBILE_TOAST_MAX_SCREEN_RATIO)
+    end
     local y = sh - TOAST_MARGIN
     local now_clock = os.clock()
 
     for index = #active, 1, -1 do
         local item = active[index]
         local theme = item.theme
-        local layout = get_toast_layout(item)
-        local desired_height = layout.height + TOAST_HEIGHT_BUFFER
-        local needs_scroll = desired_height > TOAST_MAX_HEIGHT
-        local height = needs_scroll and TOAST_MAX_HEIGHT or desired_height
+        local layout = get_toast_layout(item, toast_width)
+        local desired_height = item.measured_height or item.height or TOAST_MIN_HEIGHT
+        local needs_scroll = item.needs_scroll or false
+        local height = needs_scroll and toast_max_height or desired_height
         item.height = height
-        local position = imgui.ImVec2(sw - TOAST_WIDTH - TOAST_MARGIN, y - height)
+        local position = imgui.ImVec2(sw - toast_width - TOAST_MARGIN, y - height)
 
         imgui.SetNextWindowPos(position, imgui.Cond.Always)
-        imgui.SetNextWindowSize(imgui.ImVec2(TOAST_WIDTH, height), imgui.Cond.Always)
+        imgui.SetNextWindowSize(imgui.ImVec2(toast_width, height), imgui.Cond.Always)
 
         imgui.PushStyleVarFloat(imgui.StyleVar.WindowRounding, dpi(16))
         imgui.PushStyleVarVec2(imgui.StyleVar.WindowPadding, dpi_vec2(16, 16))
@@ -681,7 +696,7 @@ function render_toasts()
         imgui.Text(trim_text(item.script_id, 24) .. '  ' .. format_clock(item.created_at))
         imgui.PopStyleColor()
 
-        imgui.SetCursorPos(dpi_vec2(320, 14))
+        imgui.SetCursorPos(imgui.ImVec2(toast_width - dpi(46), dpi(14)))
         imgui.PushStyleColor(imgui.Col.Button, imgui.ImVec4(0, 0, 0, 0))
         imgui.PushStyleColor(imgui.Col.ButtonHovered, to_vec4(theme.accent_soft))
         imgui.PushStyleColor(imgui.Col.ButtonActive, to_vec4(theme.accent_soft))
@@ -797,6 +812,19 @@ function render_toasts()
                 imgui.GetColorU32Vec4(to_vec4(theme.accent)),
                 dpi(3)
             )
+        end
+
+        if needs_scroll then
+            item.needs_scroll = true
+            item.full_height = max_value(item.full_height or 0, toast_max_height + dpi(1))
+            item.measured_height = toast_max_height
+        else
+            local badge_bottom = layout.has_badge and (dpi(18) + TOAST_IMAGE) or 0
+            local content_bottom = max_value(badge_bottom, footer_y + footer_height)
+            local raw_height = max_value(TOAST_MIN_HEIGHT, content_bottom + dpi(16) + progress_reserved + TOAST_HEIGHT_BUFFER)
+            item.full_height = raw_height
+            item.needs_scroll = raw_height > toast_max_height
+            item.measured_height = item.needs_scroll and toast_max_height or raw_height
         end
 
         imgui.End()
