@@ -8,8 +8,82 @@ local notify = nil
 
 local MANAGER_HOST_NAME = 'NotificationManager'
 local HEARTBEAT_INTERVAL = 2
-local LIBRARY_PATH = getWorkingDirectory() .. [[\lib\session_notifications.lua]]
 local LIBRARY_RAW_URL = 'https://raw.githubusercontent.com/Mister-Sand/session_notifications/main/lib/session_notifications.lua'
+
+local function detect_separator()
+    local cwd = tostring(getWorkingDirectory() or '')
+    if cwd:find('/', 1, true) and not cwd:find('\\', 1, true) then
+        return '/'
+    end
+    if cwd:find('\\', 1, true) then
+        return '\\'
+    end
+    return MONET_DPI_SCALE ~= nil and '/' or '\\'
+end
+
+local SEPORATORPATCH = detect_separator()
+
+local function normalize_path(path)
+    path = tostring(path or '')
+    if SEPORATORPATCH == '/' then
+        return path:gsub('\\', '/')
+    end
+    return path:gsub('/', '\\')
+end
+
+local function join_path(...)
+    local result = ''
+
+    for index = 1, select('#', ...) do
+        local part = normalize_path(select(index, ...))
+        if part ~= '' then
+            if result == '' then
+                result = part:gsub('[\\/]+$', '')
+            else
+                part = part:gsub('^[\\/]+', '')
+                result = result:gsub('[\\/]+$', '') .. SEPORATORPATCH .. part
+            end
+        end
+    end
+
+    return result
+end
+
+local function dirname(path)
+    return normalize_path(path):match('^(.*)[/\\][^/\\]+$')
+end
+
+local function ensure_dir(path)
+    path = normalize_path(path)
+    if path == '' or doesDirectoryExist(path) then
+        return
+    end
+
+    local current = ''
+    local rest = path
+
+    if rest:match('^%a:[/\\]') then
+        current = rest:sub(1, 3)
+        rest = rest:sub(4)
+    elseif rest:match('^[/\\]') then
+        current = SEPORATORPATCH
+        rest = rest:sub(2)
+    end
+
+    for part in rest:gmatch('[^/\\]+') do
+        if current == '' or current == SEPORATORPATCH or current:match('^%a:[/\\]$') then
+            current = current .. part
+        else
+            current = current .. SEPORATORPATCH .. part
+        end
+
+        if not doesDirectoryExist(current) then
+            createDirectory(current)
+        end
+    end
+end
+
+local LIBRARY_PATH = join_path(getWorkingDirectory(), 'lib', 'session_notifications.lua')
 
 local history_open = imgui.new.bool(false)
 local active = {}
@@ -20,14 +94,14 @@ local queue_offset = 0
 local history_filter = 1
 
 local function ensure_parent_directory(path)
-    local normalized = tostring(path or ''):gsub('/', '\\')
-    local parent = normalized:match('^(.*)\\[^\\]+$')
-    if parent and parent ~= '' and not doesDirectoryExist(parent) then
-        createDirectory(parent)
+    local parent = dirname(path)
+    if parent and parent ~= '' then
+        ensure_dir(parent)
     end
 end
 
 local function write_text_file(path, content)
+    path = normalize_path(path)
     ensure_parent_directory(path)
     local file = assert(io.open(path, 'w'))
     file:write(content)
@@ -124,6 +198,7 @@ local history_frame = imgui.OnFrame(
 history_frame.HideCursor = false
 
 local function file_size(path)
+    path = normalize_path(path)
     local file = io.open(path, 'r')
     if not file then
         return 0
@@ -287,6 +362,7 @@ local function to_vec4(color)
 end
 
 local function resolve_texture(path)
+    path = normalize_path(path)
     if not path or path == '' or not doesFileExist(path) then
         return nil
     end

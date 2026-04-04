@@ -4,12 +4,55 @@ local M = {
     VERSION = '1.0'
 }
 
-local BASE_DIR = getWorkingDirectory() .. [[\config\session_notifications]]
-local STATE_FILE = BASE_DIR .. [[\state.json]]
-local RUNTIME_FILE = BASE_DIR .. [[\runtime.json]]
-local QUEUE_FILE = BASE_DIR .. [[\queue.jsonl]]
-local ACTION_QUEUE_FILE = BASE_DIR .. [[\actions.jsonl]]
-local CURSOR_DIR = BASE_DIR .. [[\cursors]]
+local function detect_separator()
+    local cwd = tostring(getWorkingDirectory() or '')
+    if cwd:find('/', 1, true) and not cwd:find('\\', 1, true) then
+        return '/'
+    end
+    if cwd:find('\\', 1, true) then
+        return '\\'
+    end
+    return MONET_DPI_SCALE ~= nil and '/' or '\\'
+end
+
+local SEPORATORPATCH = detect_separator()
+
+local function normalize_path(path)
+    path = tostring(path or '')
+    if SEPORATORPATCH == '/' then
+        return path:gsub('\\', '/')
+    end
+    return path:gsub('/', '\\')
+end
+
+local function join_path(...)
+    local result = ''
+
+    for index = 1, select('#', ...) do
+        local part = normalize_path(select(index, ...))
+        if part ~= '' then
+            if result == '' then
+                result = part:gsub('[\\/]+$', '')
+            else
+                part = part:gsub('^[\\/]+', '')
+                result = result:gsub('[\\/]+$', '') .. SEPORATORPATCH .. part
+            end
+        end
+    end
+
+    return result
+end
+
+local function dirname(path)
+    return normalize_path(path):match('^(.*)[/\\][^/\\]+$')
+end
+
+local BASE_DIR = join_path(getWorkingDirectory(), 'config', 'session_notifications')
+local STATE_FILE = join_path(BASE_DIR, 'state.json')
+local RUNTIME_FILE = join_path(BASE_DIR, 'runtime.json')
+local QUEUE_FILE = join_path(BASE_DIR, 'queue.jsonl')
+local ACTION_QUEUE_FILE = join_path(BASE_DIR, 'actions.jsonl')
+local CURSOR_DIR = join_path(BASE_DIR, 'cursors')
 
 local callbacks = {}
 
@@ -57,8 +100,32 @@ local PRESETS = {
 }
 
 local function ensure_dir(path)
-    if not doesDirectoryExist(path) then
-        createDirectory(path)
+    path = normalize_path(path)
+    if path == '' or doesDirectoryExist(path) then
+        return
+    end
+
+    local current = ''
+    local rest = path
+
+    if rest:match('^%a:[/\\]') then
+        current = rest:sub(1, 3)
+        rest = rest:sub(4)
+    elseif rest:match('^[/\\]') then
+        current = SEPORATORPATCH
+        rest = rest:sub(2)
+    end
+
+    for part in rest:gmatch('[^/\\]+') do
+        if current == '' or current == SEPORATORPATCH or current:match('^%a:[/\\]$') then
+            current = current .. part
+        else
+            current = current .. SEPORATORPATCH .. part
+        end
+
+        if not doesDirectoryExist(current) then
+            createDirectory(current)
+        end
     end
 end
 
@@ -68,6 +135,7 @@ local function ensure_environment()
 end
 
 local function read_file(path)
+    path = normalize_path(path)
     local file = io.open(path, 'r')
     if not file then
         return nil
@@ -79,12 +147,14 @@ local function read_file(path)
 end
 
 local function write_file(path, content)
+    path = normalize_path(path)
     local file = assert(io.open(path, 'w'))
     file:write(content)
     file:close()
 end
 
 local function append_line(path, line)
+    path = normalize_path(path)
     local file = assert(io.open(path, 'a'))
     file:write(line)
     file:close()
@@ -162,7 +232,7 @@ end
 
 local function get_cursor_path(script_id)
     ensure_environment()
-    return CURSOR_DIR .. [[\]] .. safe_name(script_id) .. '.cursor'
+    return join_path(CURSOR_DIR, safe_name(script_id) .. '.cursor')
 end
 
 local function read_state()
@@ -212,12 +282,20 @@ end
 local function get_scripts_directory()
     if thisScript then
         local script_info = thisScript()
-        if script_info and script_info.directory and script_info.directory ~= '' then
-            return script_info.directory
+        if script_info then
+            if script_info.directory and script_info.directory ~= '' then
+                return normalize_path(script_info.directory)
+            end
+            if script_info.path and script_info.path ~= '' then
+                local parent = dirname(script_info.path)
+                if parent and parent ~= '' then
+                    return parent
+                end
+            end
         end
     end
 
-    return getWorkingDirectory()
+    return normalize_path(getWorkingDirectory())
 end
 
 local function normalize_manager_config(spec)
@@ -241,7 +319,7 @@ local function normalize_manager_config(spec)
     config.raw_url = trim(config.raw_url)
     config.library_file = trim(config.library_file)
     config.library_raw_url = trim(config.library_raw_url)
-    config.path = config.path and trim(config.path) or nil
+    config.path = config.path and normalize_path(trim(config.path)) or nil
     config.heartbeat_ttl = tonumber(config.heartbeat_ttl) or DEFAULT_MANAGER_CONFIG.heartbeat_ttl
     config.load_timeout = tonumber(config.load_timeout) or DEFAULT_MANAGER_CONFIG.load_timeout
 
@@ -263,14 +341,14 @@ end
 
 local function get_manager_path(config)
     if config.path and config.path ~= '' then
-        return config.path
+        return normalize_path(config.path)
     end
 
-    return get_scripts_directory() .. [[\]] .. config.file_name
+    return join_path(get_scripts_directory(), config.file_name)
 end
 
 local function get_library_path(config)
-    return getWorkingDirectory() .. [[\]] .. config.library_file
+    return join_path(getWorkingDirectory(), config.library_file)
 end
 
 local function extract_script_version(text)
@@ -404,10 +482,9 @@ local function fetch_remote_library_script(config, on_done)
 end
 
 local function ensure_parent_directory(path)
-    local normalized = tostring(path or ''):gsub('/', '\\')
-    local parent = normalized:match('^(.*)\\[^\\]+$')
-    if parent and parent ~= '' and not doesDirectoryExist(parent) then
-        createDirectory(parent)
+    local parent = dirname(path)
+    if parent and parent ~= '' then
+        ensure_dir(parent)
     end
 end
 
