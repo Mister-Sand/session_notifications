@@ -48,11 +48,11 @@ local function detect_separator()
     return MONET_DPI_SCALE ~= nil and '/' or '\\'
 end
 
-local SEPORATORPATCH = detect_separator()
+local PATH_SEPARATOR = detect_separator()
 
 local function normalize_path(path)
     path = tostring(path or '')
-    if SEPORATORPATCH == '/' then
+    if PATH_SEPARATOR == '/' then
         return path:gsub('\\', '/')
     end
     return path:gsub('/', '\\')
@@ -68,7 +68,7 @@ local function join_path(...)
                 result = part:gsub('[\\/]+$', '')
             else
                 part = part:gsub('^[\\/]+', '')
-                result = result:gsub('[\\/]+$', '') .. SEPORATORPATCH .. part
+                result = result:gsub('[\\/]+$', '') .. PATH_SEPARATOR .. part
             end
         end
     end
@@ -154,15 +154,15 @@ local function ensure_dir(path)
         current = rest:sub(1, 3)
         rest = rest:sub(4)
     elseif rest:match('^[/\\]') then
-        current = SEPORATORPATCH
+        current = PATH_SEPARATOR
         rest = rest:sub(2)
     end
 
     for part in rest:gmatch('[^/\\]+') do
-        if current == '' or current == SEPORATORPATCH or current:match('^%a:[/\\]$') then
+        if current == '' or current == PATH_SEPARATOR or current:match('^%a:[/\\]$') then
             current = current .. part
         else
-            current = current .. SEPORATORPATCH .. part
+            current = current .. PATH_SEPARATOR .. part
         end
 
         if not doesDirectoryExist(current) then
@@ -190,6 +190,10 @@ end
 
 local function write_file(path, content)
     path = normalize_path(path)
+    local parent = dirname(path)
+    if parent and parent ~= '' then
+        ensure_dir(parent)
+    end
     local file = assert(io.open(path, 'w'))
     file:write(content)
     file:close()
@@ -197,9 +201,32 @@ end
 
 local function append_line(path, line)
     path = normalize_path(path)
+    local parent = dirname(path)
+    if parent and parent ~= '' then
+        ensure_dir(parent)
+    end
     local file = assert(io.open(path, 'a'))
     file:write(line)
     file:close()
+end
+
+local function read_json_file(path)
+    local raw = read_file(path)
+    if not raw or raw == '' then
+        return nil
+    end
+
+    local data = json.decode(raw)
+    if type(data) ~= 'table' then
+        return nil
+    end
+
+    return data
+end
+
+local function write_json_file(path, value)
+    write_file(path, json.encode(value, { indent = false }))
+    return value
 end
 
 local function read_number_file(path)
@@ -279,17 +306,7 @@ end
 
 local function read_state()
     ensure_environment()
-    local raw = read_file(STATE_FILE)
-    if not raw or raw == '' then
-        return nil
-    end
-
-    local data = json.decode(raw)
-    if type(data) ~= 'table' then
-        return nil
-    end
-
-    return data
+    return read_json_file(STATE_FILE)
 end
 
 local function get_script_id()
@@ -305,9 +322,7 @@ local DEFAULT_MANAGER_CONFIG = {
     required_version = '1.0',
     heartbeat_ttl = 6,
     load_timeout = 8,
-    raw_url = 'https://raw.githubusercontent.com/Mister-Sand/session_notifications/main/NotificationManager.lua',
     library_file = [[lib\session_notifications.lua]],
-    library_raw_url = 'https://raw.githubusercontent.com/Mister-Sand/session_notifications/main/lib/session_notifications.lua',
     path = nil
 }
 
@@ -398,6 +413,11 @@ local function extract_script_version(text)
     return text:match("script_version%(['\"]([^'\"]+)['\"]%)")
 end
 
+local function extract_library_version(text)
+    text = tostring(text or '')
+    return text:match("VERSION%s*=%s*['\"]([^'\"]+)['\"]")
+end
+
 local function split_version(version)
     local result = {}
     for part in tostring(version or ''):gmatch('[^.]+') do
@@ -436,103 +456,11 @@ local function get_local_library_version(config)
         return nil
     end
 
-    return content:match("VERSION%s*=%s*['\"]([^'\"]+)['\"]")
+    return extract_library_version(content)
 end
 
 local function get_manager_runtime(config)
     return M.is_runtime_alive(config.host_name, config.heartbeat_ttl)
-end
-
-local function is_raw_url_configured(config)
-    return config.raw_url ~= '' and not config.raw_url:find('<', 1, true)
-end
-
-local function is_library_url_configured(config)
-    return config.library_raw_url ~= '' and not config.library_raw_url:find('<', 1, true)
-end
-
-local function http_get_async(url, on_success, on_error)
-    lua_thread.create(function()
-        local ok, response = pcall(function()
-            local requests = require('requests')
-            return requests.get(url, {
-                headers = {
-                    ['Accept-Encoding'] = 'identity',
-                    ['Connection'] = 'close'
-                },
-                timeout = 15
-            })
-        end)
-
-        if ok and type(response) == 'table'
-            and tonumber(response.status_code)
-            and response.status_code >= 200
-            and response.status_code < 300 then
-            on_success({
-                ok = true,
-                status_code = tonumber(response.status_code),
-                text = tostring(response.text or '')
-            })
-            return
-        end
-
-        if ok and type(response) == 'table' then
-            on_error(string.format('HTTP %s for %s', tostring(response.status_code), url))
-            return
-        end
-
-        on_error(tostring(response))
-    end)
-end
-
-local function fetch_remote_manager_script(config, on_done)
-    if not is_raw_url_configured(config) then
-        on_done(false, nil, nil, 'manager raw_url is not configured')
-        return
-    end
-
-    http_get_async(config.raw_url, function(response)
-        local version = extract_script_version(response.text)
-        if not version then
-            on_done(false, nil, nil, 'remote manager has no script_version(...)')
-            return
-        end
-
-        on_done(true, response.text, version, nil)
-    end, function(err)
-        on_done(false, nil, nil, tostring(err))
-    end)
-end
-
-local function fetch_remote_library_script(config, on_done)
-    if not is_library_url_configured(config) then
-        on_done(false, nil, nil, 'library raw_url is not configured')
-        return
-    end
-
-    http_get_async(config.library_raw_url, function(response)
-        local version = response.text:match("VERSION%s*=%s*['\"]([^'\"]+)['\"]")
-        if not version then
-            on_done(false, nil, nil, 'remote library has no VERSION constant')
-            return
-        end
-
-        on_done(true, response.text, version, nil)
-    end, function(err)
-        on_done(false, nil, nil, tostring(err))
-    end)
-end
-
-local function ensure_parent_directory(path)
-    local parent = dirname(path)
-    if parent and parent ~= '' then
-        ensure_dir(parent)
-    end
-end
-
-local function save_text_file(path, content)
-    ensure_parent_directory(path)
-    write_file(path, content)
 end
 
 local function make_system_info(config, min_version, system_status, message)
@@ -715,6 +643,12 @@ end
 
 M.status = M.get_system_status
 
+local function get_system_status_for_version(min_version)
+    return M.get_system_status({
+        required_version = min_version
+    })
+end
+
 function M.ensure_manager(spec, callback)
     if type(spec) == 'function' and callback == nil then
         callback = spec
@@ -738,56 +672,34 @@ function M.ensure_manager(spec, callback)
     manager_bootstrap.busy = true
     manager_bootstrap.waiters = { callback }
 
-    if status.installed and compare_versions(status.local_version, config.required_version) >= 0 then
-        try_load_manager(config, function(load_ok, load_message)
-            local fresh_status = M.get_manager_status(config)
-            finish_manager_bootstrap(load_ok and fresh_status.running and fresh_status.compatible, make_manager_info(config, fresh_status, load_message))
-        end)
+    if not status.installed then
+        finish_manager_bootstrap(false, make_manager_info(
+            config,
+            status,
+            'manager file is missing; install NotificationManager.lua manually'
+        ))
         return
     end
 
-    fetch_remote_manager_script(config, function(fetch_ok, script_text, remote_version, err)
-        if not fetch_ok then
-            finish_manager_bootstrap(false, make_manager_info(config, status, err))
-            return
-        end
-
-        if compare_versions(remote_version, config.required_version) < 0 then
-            finish_manager_bootstrap(false, make_manager_info(config, status, string.format(
-                'remote manager version %s is older than required %s',
-                remote_version,
+    if status.local_version == '-' or compare_versions(status.local_version, config.required_version) < 0 then
+        finish_manager_bootstrap(false, make_manager_info(
+            config,
+            status,
+            string.format(
+                'manager version %s is lower than required %s; update NotificationManager.lua manually',
+                status.local_version or '-',
                 config.required_version
-            )))
-            return
-        end
+            )
+        ))
+        return
+    end
 
-        local path = get_manager_path(config)
-        local ok, write_err = pcall(write_file, path, script_text)
-        if not ok then
-            finish_manager_bootstrap(false, make_manager_info(config, status, 'failed to save manager: ' .. tostring(write_err)))
-            return
-        end
-
-        local running, runtime = get_manager_runtime(config)
-        local running_version = trim(runtime and runtime.version or '')
-        if running then
-            local fresh_status = M.get_manager_status(config)
-            if running_version ~= '' and compare_versions(running_version, config.required_version) >= 0 then
-                finish_manager_bootstrap(true, make_manager_info(config, fresh_status, 'manager file updated; running service is compatible'))
-            else
-                finish_manager_bootstrap(false, make_manager_info(config, fresh_status, string.format(
-                    'manager file updated to %s, but running service version is %s; reload manager',
-                    remote_version,
-                    running_version ~= '' and running_version or 'unknown'
-                )))
-            end
-            return
-        end
-
-        try_load_manager(config, function(load_ok, load_message)
-            local fresh_status = M.get_manager_status(config)
-            finish_manager_bootstrap(load_ok and fresh_status.running and fresh_status.compatible, make_manager_info(config, fresh_status, load_message))
-        end)
+    try_load_manager(config, function(load_ok, load_message)
+        local fresh_status = M.get_manager_status(config)
+        finish_manager_bootstrap(
+            load_ok and fresh_status.running and fresh_status.compatible,
+            make_manager_info(config, fresh_status, load_message)
+        )
     end)
 end
 
@@ -806,45 +718,21 @@ function M.ensure_system(spec, callback)
     end
 
     local library_status = M.get_library_status(config)
+    local function fail_system(message)
+        callback(false, make_system_info(config, min_version, get_system_status_for_version(min_version), message))
+    end
+
     if not library_status.installed then
-        callback(false, make_system_info(config, min_version, M.get_system_status({
-            required_version = min_version
-        }), 'notification system library is missing'))
+        fail_system('notification system library is missing')
         return
     end
 
     if library_status.version == '-' or compare_versions(library_status.version, min_version) < 0 then
-        fetch_remote_library_script(config, function(fetch_ok, script_text, remote_version, err)
-            if not fetch_ok then
-                callback(false, make_system_info(config, min_version, M.get_system_status({
-                    required_version = min_version
-                }), err))
-                return
-            end
-
-            if compare_versions(remote_version, min_version) < 0 then
-                callback(false, make_system_info(config, min_version, M.get_system_status({
-                    required_version = min_version
-                }), string.format(
-                    'library version %s is required, but latest available is %s',
-                    min_version,
-                    remote_version
-                )))
-                return
-            end
-
-            local ok, write_err = pcall(save_text_file, get_library_path(config), script_text)
-            if not ok then
-                callback(false, make_system_info(config, min_version, M.get_system_status({
-                    required_version = min_version
-                }), 'failed to update library: ' .. tostring(write_err)))
-                return
-            end
-
-            callback(false, make_system_info(config, min_version, M.get_system_status({
-                required_version = min_version
-            }), 'library was updated successfully; reload the script'))
-        end)
+        fail_system(string.format(
+            'library version %s is lower than required %s; update session_notifications.lua manually',
+            library_status.version or '-',
+            min_version
+        ))
         return
     end
 
@@ -894,10 +782,11 @@ function M.push_safe(min_version, spec, callback)
 
         local id, err = M.push(spec)
         if not id then
+            local required_version = get_required_version(min_version)
             local failed = make_system_info(
-                normalize_manager_config(),
-                get_required_version(min_version),
-                M.get_system_status({ required_version = get_required_version(min_version) }),
+                normalize_manager_config(min_version),
+                required_version,
+                get_system_status_for_version(required_version),
                 err
             )
             callback(false, failed)
@@ -934,66 +823,37 @@ function M.get_session()
     return read_state()
 end
 
-function M.get_runtime()
-    ensure_environment()
-
-    local raw = read_file(RUNTIME_FILE)
-    if not raw or raw == '' then
-        return nil
-    end
-
-    local data = json.decode(raw)
-    if type(data) ~= 'table' then
-        return nil
-    end
-
-    return data
-end
-
-function M.set_runtime(spec)
-    ensure_environment()
-
-    spec = spec or {}
+local function build_runtime_record(spec, current_runtime)
     local now = os.time()
-    local runtime = {
-        host_name = tostring(spec.host_name or get_script_id()),
-        session_id = tostring(spec.session_id or ''),
-        version = tostring(spec.version or ''),
-        started_at = tonumber(spec.started_at) or now,
-        updated_at = now,
-        heartbeat_at = now
-    }
+    local runtime = clone_table(current_runtime or {})
 
-    for key, value in pairs(spec) do
-        if runtime[key] == nil then
-            runtime[key] = value
-        end
-    end
-
-    write_file(RUNTIME_FILE, json.encode(runtime, { indent = false }))
-    return runtime
-end
-
-function M.touch_runtime(spec)
-    ensure_environment()
-
-    local runtime = M.get_runtime() or {}
-    spec = spec or {}
-
-    for key, value in pairs(spec) do
+    for key, value in pairs(spec or {}) do
         runtime[key] = value
     end
 
-    local now = os.time()
     runtime.host_name = tostring(runtime.host_name or get_script_id())
     runtime.session_id = tostring(runtime.session_id or '')
     runtime.version = tostring(runtime.version or '')
     runtime.started_at = tonumber(runtime.started_at) or now
     runtime.updated_at = now
     runtime.heartbeat_at = now
-
-    write_file(RUNTIME_FILE, json.encode(runtime, { indent = false }))
     return runtime
+end
+
+function M.get_runtime()
+    ensure_environment()
+    return read_json_file(RUNTIME_FILE)
+end
+
+function M.set_runtime(spec)
+    ensure_environment()
+    return write_json_file(RUNTIME_FILE, build_runtime_record(spec))
+end
+
+function M.touch_runtime(spec)
+    ensure_environment()
+    local runtime = build_runtime_record(spec, M.get_runtime() or {})
+    return write_json_file(RUNTIME_FILE, runtime)
 end
 
 function M.is_runtime_alive(host_name, max_age)
@@ -1029,19 +889,18 @@ function M.start_session(host_name)
         started_at = os.time()
     }
 
-    write_file(STATE_FILE, json.encode(state, { indent = false }))
-    return state
+    return write_json_file(STATE_FILE, state)
 end
 
-function M.push(spec)
-    ensure_environment()
-
-    spec = spec or {}
-    local session = read_state()
-    if not session or not session.session_id then
-        return nil, 'notification-center session is not active'
+local function resolve_theme_name(theme_name)
+    local base_theme = tostring(theme_name or 'ocean')
+    if not PRESETS[base_theme] then
+        return 'ocean'
     end
+    return base_theme
+end
 
+local function build_notification_payload(spec, session)
     local title = tostring(spec.title or '')
     local text = tostring(spec.text or spec.message or '')
     if title == '' and text == '' then
@@ -1053,11 +912,7 @@ function M.push(spec)
         duration = 5
     end
 
-    local base_theme = tostring(spec.theme or 'ocean')
-    if not PRESETS[base_theme] then
-        base_theme = 'ocean'
-    end
-
+    local base_theme = resolve_theme_name(spec.theme)
     local payload = {
         kind = 'notification',
         version = 1,
@@ -1083,6 +938,23 @@ function M.push(spec)
         payload.action_id = tostring(spec.action.id or '')
         payload.action_label = tostring(spec.action.label or '')
         payload.action_payload = spec.action.payload
+    end
+
+    return payload
+end
+
+function M.push(spec)
+    ensure_environment()
+
+    spec = spec or {}
+    local session = read_state()
+    if not session or not session.session_id then
+        return nil, 'notification-center session is not active'
+    end
+
+    local payload, err = build_notification_payload(spec, session)
+    if not payload then
+        return nil, err
     end
 
     append_line(QUEUE_FILE, json.encode(payload, { indent = false }) .. '\n')
@@ -1130,6 +1002,13 @@ function M.emit_action(spec)
 
     append_line(ACTION_QUEUE_FILE, json.encode(payload, { indent = false }) .. '\n')
     return payload.id
+end
+
+local function matches_action_payload(payload, session_id, script_id)
+    return type(payload) == 'table'
+        and payload.kind == 'action'
+        and payload.session_id == session_id
+        and payload.target_script_id == script_id
 end
 
 function M.process_actions()
@@ -1185,10 +1064,7 @@ function M.process_actions()
 
         if line ~= '' then
             local payload = json.decode(line)
-            if type(payload) == 'table'
-                and payload.kind == 'action'
-                and payload.session_id == session.session_id
-                and payload.target_script_id == script_id then
+            if matches_action_payload(payload, session.session_id, script_id) then
                 local callback = callbacks[payload.action_id]
                 if callback then
                     pcall(callback, payload)
